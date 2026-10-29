@@ -1,194 +1,136 @@
-import utils.http_session
-import utils.transport
-import utils.session
 import base64
-import logging
+import json
 import os
 import re
 import secrets
-import sys
+import threading
 import time
-from pathlib import Path
-from threading import Lock
+import urllib.error
+import urllib.parse
+import urllib.request
 
-import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-logging.basicConfig(level=logging.INFO)
+from form import FORM_TEMPLATE
 
-# ---------- config ----------
 GITHUB_API = "https://api.github.com"
-
-
-def must_env(key: str) -> str:
-    v = os.getenv(key, "")
-    if not v:
-        sys.exit(f"missing required env var {key}")
-    return v
-
-
-TOKEN = must_env("GITHUB_TOKEN")
-REPO = must_env("GITHUB_REPO")
-ORIGIN = os.getenv("ALLOWED_ORIGIN", "")
-BASE = os.getenv("GITHUB_BASE_BRANCH", "main")
-TRUST_PROXY = os.getenv("TRUST_PROXY") == "true"
+TOKEN = os.environ.get("GITHUB_TOKEN", "")
+BASE = os.environ.get("GITHUB_BASE_BRANCH", "main")
+ORIGIN = os.environ.get("ALLOWED_ORIGIN", "")  # optional: only if the form is hosted elsewhere
 PATH_RE = re.compile(r"^[A-Za-z0-9_\-/]+\.mdx$")
+MAX_BODY = 150_000
 
-HEADERS = {
-    "Authorization": f"Bearer {TOKEN}",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-}
+# Accepts "owner/name" or a full URL like https://github.com/owner/name(.git)
+REPO = os.environ.get("GITHUB_REPO", "").strip().rstrip("/")
+REPO = re.sub(r"^(https?://)?(www\.)?github\.com/", "", REPO)
+REPO = re.sub(r"\.git$", "", REPO)
 
-FORM_HTML = (
-    (Path(__file__).parent / "contribute.html")
-    .read_text(encoding="utf-8")
-    .replace("__API_URL__", "/submit")
-    .replace("__RAW_BASE__", f"https://raw.githubusercontent.com/{REPO}/{BASE}/")
+# Vercel sits behind a proxy, so trust X-Forwarded-For there
+TRUST_PROXY = os.environ.get("TRUST_PROXY", "true" if os.environ.get("VERCEL") else "false") == "true"
+
+# Form page with the API and raw-file URLs filled in from config
+FORM_HTML = FORM_TEMPLATE.replace("__API_URL__", "/submit").replace(
+    "__RAW_BASE__", f"https://raw.githubusercontent.com/{REPO}/{BASE}/"
 )
 
+app = FastAPI()
 
-# ---------- model ----------
-class Edit(BaseModel):
-    path: str
-    content: str
-    summary: str
-    name: str = ""
-    website: str = ""  # honeypot
-
-
-# ---------- rate limiter ----------
-class RateLimiter:
-    def __init__(self, limit: int, window_seconds: float):
-        self.limit = limit
-        self.window = window_seconds
-        self.hits: dict[str, list[float]] = {}
-        self.lock = Lock()
-
-    def allow(self, key: str) -> bool:
-        with self.lock:
-            now = time.time()
-            recent = [t for t in self.hits.get(key, []) if now - t < self.window]
-            if len(recent) >= self.limit:
-                self.hits[key] = recent
-                return False
-            recent.append(now)
-            self.hits[key] = recent
-            return True
+if ORIGIN:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[ORIGIN],
+        allow_methods=["POST"],
+        allow_headers=["Content-Type"],
+    )
 
 
-limiter = RateLimiter(5, 3600)  # 5 submissions per IP per hour
+# Errors use {"ok": false, "error": "..."} so the form can show them
+@app.exception_handler(StarletteHTTPException)
+async def http_error(_, exc):
+    return JSONResponse({"ok": False, "error": str(exc.detail)}, status_code=exc.status_code)
 
 
-# ---------- helpers ----------
-def client_ip(request: Request) -> str:
+@app.exception_handler(RequestValidationError)
+async def validation_error(_, exc):
+    return JSONResponse({"ok": False, "error": "Invalid input, check the field lengths"}, status_code=400)
+
+
+# ---------- rate limiting (5 submissions per IP per hour) ----------
+# Best effort on Vercel: memory is per serverless instance and resets on cold starts.
+
+RATE_LIMIT, RATE_WINDOW = 5, 3600
+_hits = {}
+_lock = threading.Lock()
+
+
+def allow(key):
+    now = time.time()
+    with _lock:
+        recent = [t for t in _hits.get(key, []) if now - t < RATE_WINDOW]
+        if len(recent) >= RATE_LIMIT:
+            _hits[key] = recent
+            return False
+        recent.append(now)
+        _hits[key] = recent
+        return True
+
+
+def client_ip(request: Request):
     if TRUST_PROXY:
-        xff = request.headers.get("x-forwarded-for")
+        xff = request.headers.get("x-forwarded-for", "")
         if xff:
             return xff.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
-def err(msg: str, status: int) -> JSONResponse:
-    return JSONResponse({"ok": False, "error": msg}, status_code=status)
+# ---------- GitHub ----------
 
-
-def validate(e: Edit) -> str:
-    if not PATH_RE.match(e.path) or ".." in e.path:
-        return "invalid page path"
-    if not e.content.strip() or len(e.content) > 100_000:
-        return "content must be 1-100000 characters"
-    e.summary = " ".join(e.summary.split())
-    if not e.summary or len(e.summary) > 200:
-        return "summary must be 1-200 characters"
-    e.name = " ".join(e.name.split()) or "Anonymous"
-    if len(e.name) > 80:
-        return "name too long"
-    return ""
-
-
-# ---------- github ----------
-def gh(client: httpx.Client, method: str, path: str, json=None, ok=(200,)) -> httpx.Response:
-    resp = client.request(method, GITHUB_API + path, json=json, headers=HEADERS)
-    if resp.status_code not in ok:
-        raise RuntimeError(f"{method} {path}: unexpected status {resp.status_code}")
-    return resp
-
-
-def open_pr(e: Edit) -> str:
-    with httpx.Client(timeout=20) as client:
-        # 1. latest commit on base branch
-        r = gh(client, "GET", f"/repos/{REPO}/git/ref/heads/{BASE}")
-        base_sha = r.json()["object"]["sha"]
-
-        # 2. new branch
-        branch = f"contrib/{int(time.time())}-{secrets.token_hex(3)}"
-        gh(
-            client,
-            "POST",
-            f"/repos/{REPO}/git/refs",
-            json={"ref": f"refs/heads/{branch}", "sha": base_sha},
-            ok=(201,),
-        )
-
-        try:
-            # 3. existing file sha (404 = new page)
-            file_path = f"/repos/{REPO}/contents/{e.path}"
-            body = {
-                "message": e.summary,
-                "content": base64.b64encode(e.content.encode("utf-8")).decode(),
-                "branch": branch,
-            }
-            r = client.get(GITHUB_API + file_path, params={"ref": BASE}, headers=HEADERS)
-            if r.status_code == 200:
-                body["sha"] = r.json()["sha"]
-            elif r.status_code != 404:
-                raise RuntimeError(f"lookup file: unexpected status {r.status_code}")
-
-            # 4. commit
-            gh(client, "PUT", file_path, json=body, ok=(200, 201))
-
-            # 5. pull request
-            r = gh(
-                client,
-                "POST",
-                f"/repos/{REPO}/pulls",
-                json={
-                    "title": e.summary,
-                    "head": branch,
-                    "base": BASE,
-                    "body": f"Submitted via the contribution form by **{e.name}**.\n\nPage: `{e.path}`",
-                },
-                ok=(201,),
-            )
-            return r.json()["html_url"]
-        except Exception:
-            # remove the orphan branch, then re-raise
-            try:
-                gh(client, "DELETE", f"/repos/{REPO}/git/refs/heads/{branch}", ok=(204,))
-            except Exception:
-                pass
-            raise
-
-
-# ---------- app ----------
-app = FastAPI()
-
-if ORIGIN:  # cross-origin hosting only
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[ORIGIN],
-        allow_methods=["POST", "OPTIONS"],
-        allow_headers=["Content-Type"],
+def gh(method, path, body=None):
+    """Call the GitHub API. Returns (status, json). Never raises on HTTP errors."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        GITHUB_API + path,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "contribution-backend",
+            "Content-Type": "application/json",
+        },
     )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, None
 
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
+def expect(status, *ok, step=""):
+    if status not in ok:
+        print(f"GitHub step failed: {step} -> {status}")  # shows in Vercel logs
+        raise HTTPException(502, "Could not create pull request")
+
+
+# ---------- routes ----------
+
+class Edit(BaseModel):
+    path: str
+    content: str = Field(max_length=100_000)
+    summary: str = Field(max_length=200)
+    name: str = Field(default="Anonymous", max_length=80)
+    website: str = ""  # honeypot
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -196,19 +138,79 @@ def form_page():
     return FORM_HTML
 
 
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "configured": bool(TOKEN and REPO)}
+
+
 @app.post("/submit")
-def submit(e: Edit, request: Request):  # plain def: blocking httpx runs in threadpool
-    if int(request.headers.get("content-length") or 0) > 150_000:
-        return err("payload too large", 413)
-    if not limiter.allow(client_ip(request)):
-        return err("too many submissions, try again later", 429)
-    if e.website:  # bot: pretend success
-        return {"ok": True}
-    msg = validate(e)
-    if msg:
-        return err(msg, 400)
+def submit(edit: Edit, request: Request):
+    if not allow(client_ip(request)):
+        raise HTTPException(429, "Too many submissions, try again later")
+    if int(request.headers.get("content-length") or 0) > MAX_BODY:
+        raise HTTPException(413, "Request too large")
+
+    if edit.website:
+        return {"ok": True}  # bot: pretend success
+
+    if not (TOKEN and REPO):
+        raise HTTPException(500, "Server is not configured")
+    if not PATH_RE.match(edit.path) or ".." in edit.path:
+        raise HTTPException(400, "Invalid page path")
+    if not edit.content.strip():
+        raise HTTPException(400, "Content is empty")
+
+    summary = " ".join(edit.summary.split())
+    name = " ".join(edit.name.split()) or "Anonymous"
+    if not summary:
+        raise HTTPException(400, "Summary is required")
+
+    # 1. Latest commit on the base branch
+    status, ref = gh("GET", f"/repos/{REPO}/git/ref/heads/{BASE}")
+    expect(status, 200, step="get base ref")
+    base_sha = ref["object"]["sha"]
+
+    # 2. New branch
+    branch = f"contrib/{int(time.time())}-{secrets.token_hex(3)}"
+    status, _ = gh(
+        "POST",
+        f"/repos/{REPO}/git/refs",
+        {"ref": f"refs/heads/{branch}", "sha": base_sha},
+    )
+    expect(status, 201, step="create branch")
+
     try:
-        return {"ok": True, "pr_url": open_pr(e)}
-    except Exception as ex:
-        logging.error("open_pr failed: %s", ex)
-        return err("could not create pull request", 502)
+        # 3. Existing file SHA (needed to update; 404 means a new page)
+        file_path = f"/repos/{REPO}/contents/{urllib.parse.quote(edit.path)}"
+        status, existing = gh("GET", f"{file_path}?ref={urllib.parse.quote(BASE)}")
+        body = {
+            "message": summary,
+            "content": base64.b64encode(edit.content.encode()).decode(),
+            "branch": branch,
+        }
+        if status == 200:
+            body["sha"] = existing["sha"]
+        else:
+            expect(status, 404, step="lookup file")
+
+        # 4. Commit
+        status, _ = gh("PUT", file_path, body)
+        expect(status, 200, 201, step="commit file")
+
+        # 5. Pull request
+        status, pr = gh(
+            "POST",
+            f"/repos/{REPO}/pulls",
+            {
+                "title": summary,
+                "head": branch,
+                "base": BASE,
+                "body": f"Submitted via the contribution form by **{name}**.\n\nPage: `{edit.path}`",
+            },
+        )
+        expect(status, 201, step="open PR")
+    except Exception:
+        gh("DELETE", f"/repos/{REPO}/git/refs/heads/{branch}")  # clean up
+        raise
+
+    return {"ok": True, "pr_url": pr["html_url"]}
