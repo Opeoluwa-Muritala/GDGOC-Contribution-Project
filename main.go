@@ -1,352 +1,216 @@
-package main
+import base64
+import json
+import os
+import re
+import secrets
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
-import (
-	"bytes"
-	"crypto/rand"
-	"encoding/base64"
-	"encoding/hex"
-	_ "embed"
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net"
-	"net/http"
-	"os"
-	"regexp"
-	"strings"
-	"sync"
-	"time"
-	"unicode/utf8"
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from form import FORM_TEMPLATE
+
+GITHUB_API = "https://api.github.com"
+TOKEN = os.environ.get("GITHUB_TOKEN", "")
+BASE = os.environ.get("GITHUB_BASE_BRANCH", "main")
+ORIGIN = os.environ.get("ALLOWED_ORIGIN", "")  # optional: only if the form is hosted elsewhere
+PATH_RE = re.compile(r"^[A-Za-z0-9_\-/]+\.mdx$")
+MAX_BODY = 150_000
+
+# Accepts "owner/name" or a full URL like https://github.com/owner/name(.git)
+REPO = os.environ.get("GITHUB_REPO", "").strip().rstrip("/")
+REPO = re.sub(r"^(https?://)?(www\.)?github\.com/", "", REPO)
+REPO = re.sub(r"\.git$", "", REPO)
+
+# Vercel sits behind a proxy, so trust X-Forwarded-For there
+TRUST_PROXY = os.environ.get("TRUST_PROXY", "true" if os.environ.get("VERCEL") else "false") == "true"
+
+# Form page with the API and raw-file URLs filled in from config
+FORM_HTML = FORM_TEMPLATE.replace("__API_URL__", "/submit").replace(
+    "__RAW_BASE__", f"https://raw.githubusercontent.com/{REPO}/{BASE}/"
 )
 
-const githubAPI = "https://api.github.com"
+app = FastAPI()
 
-var (
-	token      = mustEnv("GITHUB_TOKEN")
-	repo       = mustEnv("GITHUB_REPO")
-	origin     = os.Getenv("ALLOWED_ORIGIN") // optional: only needed if the form is hosted elsewhere
-	baseBranch = getEnv("GITHUB_BASE_BRANCH", "main")
-	trustProxy = os.Getenv("TRUST_PROXY") == "true"
-	pathRe     = regexp.MustCompile(`^[A-Za-z0-9_\-/]+\.mdx$`)
-	httpClient = &http.Client{Timeout: 20 * time.Second}
-	limiter    = newRateLimiter(5, time.Hour) // 5 submissions per IP per hour
-)
+if ORIGIN:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[ORIGIN],
+        allow_methods=["POST"],
+        allow_headers=["Content-Type"],
+    )
 
-//go:embed contribute.html
-var formTemplate string
 
-// Form served at "/", with the API and raw-file URLs filled in from config.
-var formHTML = strings.NewReplacer(
-	"__API_URL__", "/submit",
-	"__RAW_BASE__", fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/", repo, baseBranch),
-).Replace(formTemplate)
+# Errors use {"ok": false, "error": "..."} so the form can show them
+@app.exception_handler(StarletteHTTPException)
+async def http_error(_, exc):
+    return JSONResponse({"ok": False, "error": str(exc.detail)}, status_code=exc.status_code)
 
-type edit struct {
-	Path    string `json:"path"`
-	Content string `json:"content"`
-	Summary string `json:"summary"`
-	Name    string `json:"name"`
-	Website string `json:"website"` // honeypot
-}
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	})
-	mux.HandleFunc("/submit", submit)
-	mux.HandleFunc("/", formPage)
+@app.exception_handler(RequestValidationError)
+async def validation_error(_, exc):
+    return JSONResponse({"ok": False, "error": "Invalid input, check the field lengths"}, status_code=400)
 
-	port := getEnv("PORT", "8080")
-	srv := &http.Server{
-		Addr:              ":" + port,
-		Handler:           cors(mux),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      45 * time.Second,
-	}
-	log.Printf("listening on :%s", port)
-	log.Fatal(srv.ListenAndServe())
-}
 
-// ---------- handlers ----------
+# ---------- rate limiting (5 submissions per IP per hour) ----------
+# Best effort on Vercel: memory is per serverless instance and resets on cold starts.
 
-func formPage(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, formHTML)
-}
+RATE_LIMIT, RATE_WINDOW = 5, 3600
+_hits = {}
+_lock = threading.Lock()
 
-func submit(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		httpErr(w, http.StatusMethodNotAllowed, "POST only")
-		return
-	}
-	if !limiter.allow(clientIP(r)) {
-		httpErr(w, http.StatusTooManyRequests, "too many submissions, try again later")
-		return
-	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, 150_000)
-	var e edit
-	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
-		httpErr(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
+def allow(key):
+    now = time.time()
+    with _lock:
+        recent = [t for t in _hits.get(key, []) if now - t < RATE_WINDOW]
+        if len(recent) >= RATE_LIMIT:
+            _hits[key] = recent
+            return False
+        recent.append(now)
+        _hits[key] = recent
+        return True
 
-	if e.Website != "" { // bot: pretend success
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-		return
-	}
-	if msg := validate(&e); msg != "" {
-		httpErr(w, http.StatusBadRequest, msg)
-		return
-	}
 
-	prURL, err := openPR(e)
-	if err != nil {
-		log.Printf("openPR failed: %v", err)
-		httpErr(w, http.StatusBadGateway, "could not create pull request")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pr_url": prURL})
-}
+def client_ip(request: Request):
+    if TRUST_PROXY:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
-func validate(e *edit) string {
-	if !pathRe.MatchString(e.Path) || strings.Contains(e.Path, "..") {
-		return "invalid page path"
-	}
-	if strings.TrimSpace(e.Content) == "" || utf8.RuneCountInString(e.Content) > 100_000 {
-		return "content must be 1-100000 characters"
-	}
-	e.Summary = strings.Join(strings.Fields(e.Summary), " ") // collapse newlines
-	if e.Summary == "" || utf8.RuneCountInString(e.Summary) > 200 {
-		return "summary must be 1-200 characters"
-	}
-	e.Name = strings.Join(strings.Fields(e.Name), " ")
-	if e.Name == "" {
-		e.Name = "Anonymous"
-	}
-	if utf8.RuneCountInString(e.Name) > 80 {
-		return "name too long"
-	}
-	return ""
-}
 
-// ---------- GitHub flow ----------
+# ---------- GitHub ----------
 
-func openPR(e edit) (string, error) {
-	// 1. Latest commit on the base branch
-	var ref struct {
-		Object struct {
-			SHA string `json:"sha"`
-		} `json:"object"`
-	}
-	if err := gh("GET", fmt.Sprintf("/repos/%s/git/ref/heads/%s", repo, baseBranch), nil, &ref, 200); err != nil {
-		return "", fmt.Errorf("get base ref: %w", err)
-	}
+def gh(method, path, body=None):
+    """Call the GitHub API. Returns (status, json). Never raises on HTTP errors."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        GITHUB_API + path,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "contribution-backend",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, None
 
-	// 2. New branch
-	branch := fmt.Sprintf("contrib/%d-%s", time.Now().Unix(), randHex(3))
-	err := gh("POST", fmt.Sprintf("/repos/%s/git/refs", repo),
-		map[string]string{"ref": "refs/heads/" + branch, "sha": ref.Object.SHA}, nil, 201)
-	if err != nil {
-		return "", fmt.Errorf("create branch: %w", err)
-	}
 
-	// Remove the branch again if anything below fails
-	ok := false
-	defer func() {
-		if !ok {
-			_ = gh("DELETE", fmt.Sprintf("/repos/%s/git/refs/heads/%s", repo, branch), nil, nil, 204)
-		}
-	}()
+def expect(status, *ok, step=""):
+    if status not in ok:
+        print(f"GitHub step failed: {step} -> {status}")  # shows in Vercel logs
+        raise HTTPException(502, "Could not create pull request")
 
-	// 3. Existing file SHA (needed to update; a 404 means a new page)
-	body := map[string]string{
-		"message": e.Summary,
-		"content": base64.StdEncoding.EncodeToString([]byte(e.Content)),
-		"branch":  branch,
-	}
-	var existing struct {
-		SHA string `json:"sha"`
-	}
-	filePath := fmt.Sprintf("/repos/%s/contents/%s", repo, e.Path)
-	status, err := ghStatus("GET", filePath+"?ref="+baseBranch, nil, &existing)
-	switch {
-	case err != nil:
-		return "", fmt.Errorf("lookup file: %w", err)
-	case status == 200:
-		body["sha"] = existing.SHA
-	case status != 404:
-		return "", fmt.Errorf("lookup file: unexpected status %d", status)
-	}
 
-	// 4. Commit
-	if err := gh("PUT", filePath, body, nil, 200, 201); err != nil {
-		return "", fmt.Errorf("commit file: %w", err)
-	}
+# ---------- routes ----------
 
-	// 5. Pull request
-	var pr struct {
-		HTMLURL string `json:"html_url"`
-	}
-	err = gh("POST", fmt.Sprintf("/repos/%s/pulls", repo), map[string]string{
-		"title": e.Summary,
-		"head":  branch,
-		"base":  baseBranch,
-		"body":  fmt.Sprintf("Submitted via the contribution form by **%s**.\n\nPage: `%s`", e.Name, e.Path),
-	}, &pr, 201)
-	if err != nil {
-		return "", fmt.Errorf("open PR: %w", err)
-	}
+class Edit(BaseModel):
+    path: str
+    content: str = Field(max_length=100_000)
+    summary: str = Field(max_length=200)
+    name: str = Field(default="Anonymous", max_length=80)
+    website: str = ""  # honeypot
 
-	ok = true
-	return pr.HTMLURL, nil
-}
 
-// gh calls the GitHub API and errors unless the status is in wantStatus.
-func gh(method, path string, body, out any, wantStatus ...int) error {
-	status, err := ghStatus(method, path, body, out)
-	if err != nil {
-		return err
-	}
-	for _, s := range wantStatus {
-		if status == s {
-			return nil
-		}
-	}
-	return fmt.Errorf("%s %s: unexpected status %d", method, path, status)
-}
+@app.get("/", response_class=HTMLResponse)
+def form_page():
+    return FORM_HTML
 
-// ghStatus calls the GitHub API and returns the status code; out is decoded on 2xx.
-func ghStatus(method, path string, body, out any) (int, error) {
-	var rdr io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return 0, err
-		}
-		rdr = bytes.NewReader(b)
-	}
-	req, err := http.NewRequest(method, githubAPI+path, rdr)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "configured": bool(TOKEN and REPO)}
 
-	if out != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			return resp.StatusCode, err
-		}
-	} else {
-		_, _ = io.Copy(io.Discard, resp.Body)
-	}
-	return resp.StatusCode, nil
-}
 
-// ---------- middleware and helpers ----------
+@app.post("/submit")
+def submit(edit: Edit, request: Request):
+    if not allow(client_ip(request)):
+        raise HTTPException(429, "Too many submissions, try again later")
+    if int(request.headers.get("content-length") or 0) > MAX_BODY:
+        raise HTTPException(413, "Request too large")
 
-func cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if origin != "" { // cross-origin hosting only; same-origin needs no CORS
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-			w.Header().Set("Vary", "Origin")
-			if r.Method == http.MethodOptions {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
-}
+    if edit.website:
+        return {"ok": True}  # bot: pretend success
 
-type rateLimiter struct {
-	mu     sync.Mutex
-	hits   map[string][]time.Time
-	limit  int
-	window time.Duration
-}
+    if not (TOKEN and REPO):
+        raise HTTPException(500, "Server is not configured")
+    if not PATH_RE.match(edit.path) or ".." in edit.path:
+        raise HTTPException(400, "Invalid page path")
+    if not edit.content.strip():
+        raise HTTPException(400, "Content is empty")
 
-func newRateLimiter(limit int, window time.Duration) *rateLimiter {
-	return &rateLimiter{hits: map[string][]time.Time{}, limit: limit, window: window}
-}
+    summary = " ".join(edit.summary.split())
+    name = " ".join(edit.name.split()) or "Anonymous"
+    if not summary:
+        raise HTTPException(400, "Summary is required")
 
-func (l *rateLimiter) allow(key string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := time.Now()
-	recent := l.hits[key][:0]
-	for _, t := range l.hits[key] {
-		if now.Sub(t) < l.window {
-			recent = append(recent, t)
-		}
-	}
-	if len(recent) >= l.limit {
-		l.hits[key] = recent
-		return false
-	}
-	l.hits[key] = append(recent, now)
-	return true
-}
+    # 1. Latest commit on the base branch
+    status, ref = gh("GET", f"/repos/{REPO}/git/ref/heads/{BASE}")
+    expect(status, 200, step="get base ref")
+    base_sha = ref["object"]["sha"]
 
-func clientIP(r *http.Request) string {
-	if trustProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			return strings.TrimSpace(strings.Split(xff, ",")[0])
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
+    # 2. New branch
+    branch = f"contrib/{int(time.time())}-{secrets.token_hex(3)}"
+    status, _ = gh(
+        "POST",
+        f"/repos/{REPO}/git/refs",
+        {"ref": f"refs/heads/{branch}", "sha": base_sha},
+    )
+    expect(status, 201, step="create branch")
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
+    try:
+        # 3. Existing file SHA (needed to update; 404 means a new page)
+        file_path = f"/repos/{REPO}/contents/{urllib.parse.quote(edit.path)}"
+        status, existing = gh("GET", f"{file_path}?ref={urllib.parse.quote(BASE)}")
+        body = {
+            "message": summary,
+            "content": base64.b64encode(edit.content.encode()).decode(),
+            "branch": branch,
+        }
+        if status == 200:
+            body["sha"] = existing["sha"]
+        else:
+            expect(status, 404, step="lookup file")
 
-func httpErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
-}
+        # 4. Commit
+        status, _ = gh("PUT", file_path, body)
+        expect(status, 200, 201, step="commit file")
 
-func randHex(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
+        # 5. Pull request
+        status, pr = gh(
+            "POST",
+            f"/repos/{REPO}/pulls",
+            {
+                "title": summary,
+                "head": branch,
+                "base": BASE,
+                "body": f"Submitted via the contribution form by **{name}**.\n\nPage: `{edit.path}`",
+            },
+        )
+        expect(status, 201, step="open PR")
+    except Exception:
+        gh("DELETE", f"/repos/{REPO}/git/refs/heads/{branch}")  # clean up
+        raise
 
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func mustEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		log.Fatalf("missing required env var %s", key)
-	}
-	return v
-}
+    return {"ok": True, "pr_url": pr["html_url"]}
