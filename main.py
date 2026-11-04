@@ -91,20 +91,14 @@ def client_ip(request: Request):
 # ---------- GitHub ----------
 
 def gh(method, path, body=None):
-    """Call the GitHub API. Returns (status, json). Never raises on HTTP errors."""
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        GITHUB_API + path,
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "contribution-backend",
-            "Content-Type": "application/json",
-        },
-    )
+    req = urllib.request.Request(GITHUB_API + path, data=data, method=method, headers={
+        "Authorization": f"Bearer {TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "contribution-backend",
+        "Content-Type": "application/json",
+    })
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             raw = resp.read()
@@ -115,14 +109,17 @@ def gh(method, path, body=None):
             return e.code, json.loads(raw)
         except ValueError:
             return e.code, None
+    except Exception as e:  # timeouts, DNS: previously an unhandled 500
+        print(f"GitHub network error: {e}")
+        return 0, None
 
 
-def expect(status, *ok, step=""):
+def expect(status, *ok, step="", resp=None):
     if status not in ok:
-        print(f"GitHub step failed: {step} -> {status}")  # shows in Vercel logs
-        raise HTTPException(502, "Could not create pull request")
-
-
+        msg = resp.get("message") if isinstance(resp, dict) else ""
+        print(f"GitHub step failed: {step} -> {status} {msg} repo={REPO} base={BASE}")
+        raise HTTPException(502, f"Could not create pull request ({step})")
+    
 # ---------- routes ----------
 
 class Edit(BaseModel):
@@ -214,3 +211,6 @@ def submit(edit: Edit, request: Request):
         raise
 
     return {"ok": True, "pr_url": pr["html_url"]}
+
+status, ref = gh("GET", f"/repos/{REPO}/git/ref/heads/{BASE}")
+expect(status, 200, step="get base ref", resp=ref)
