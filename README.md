@@ -1,24 +1,30 @@
-# Contribution Backend (Go)
+# GDG on Campus Contribution Form
 
-Serves the contribution form at `/` and opens GitHub pull requests from `POST /submit`.
-The form is embedded in the binary (`contribute.html`), so deploy a single file.
-Link doc pages to `https://YOUR-HOST/?page=<page-path>`.
+FastAPI form for proposing edits to the GDG on Campus Unilorin Resource Hub. Each accepted submission creates a branch, commits the edited Markdown/MDX file, and opens a GitHub pull request.
 
-## Run
+## Local setup
+
+1. Copy `.env.example` to `.env` and fill in the values.
+2. Give the fine-grained GitHub token access to the target repository with:
+   - **Contents:** Read and write
+   - **Pull requests:** Read and write
+3. Install and run:
+
 ```bash
-export $(grep -v '^#' .env.example | xargs)   # edit values first
-go run .
+python -m pip install -r requirements.txt
+python main.py
 ```
 
-## Test
-```bash
-curl -X POST localhost:8080/submit -H "Content-Type: application/json" \
-  -d '{"path":"careers/cv-tips.mdx","content":"---\ntitle: \"CV Tips\"\n---\n\nHello","summary":"Test edit","name":"Ada"}'
+Open `http://127.0.0.1:8000`.
+
+## Deployment
+
+Set `GITHUB_TOKEN`, `GITHUB_REPO`, and `GITHUB_BASE_BRANCH` as secret environment variables on the hosting platform. Do not deploy the local `.env` file.
+
+Use this startup command if the platform does not run `main.py` directly:
+
+```text
+uvicorn main:app --host 0.0.0.0 --port $PORT
 ```
 
-## Build
-```bash
-go build -o contribution-backend .
-```
-
-Standard library only, no dependencies.
+The health endpoint is `/healthz`.
