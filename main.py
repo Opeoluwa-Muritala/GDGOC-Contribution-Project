@@ -1,14 +1,13 @@
 import base64
-import json
 import os
 import re
 import secrets
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
+from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,10 +18,31 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from form import FORM_TEMPLATE
 
 GITHUB_API = "https://api.github.com"
+
+
+def load_local_env():
+    """Load local development settings without overriding deployment variables."""
+    env_file = Path(__file__).with_name(".env")
+    if not env_file.is_file():
+        return
+    for raw_line in env_file.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if value[:1] == value[-1:] and value[:1] in {'"', "'"}:
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
+
+load_local_env()
+
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
 BASE = os.environ.get("GITHUB_BASE_BRANCH", "main")
 ORIGIN = os.environ.get("ALLOWED_ORIGIN", "")  # optional: only if the form is hosted elsewhere
-PATH_RE = re.compile(r"^[A-Za-z0-9_\-/]+\.mdx$")
+PATH_RE = re.compile(r"^[A-Za-z0-9_\-/]+\.mdx?$")
 MAX_BODY = 150_000
 
 # Accepts "owner/name" or a full URL like https://github.com/owner/name(.git)
@@ -91,26 +111,28 @@ def client_ip(request: Request):
 # ---------- GitHub ----------
 
 def gh(method, path, body=None):
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(GITHUB_API + path, data=data, method=method, headers={
+    headers = {
         "Authorization": f"Bearer {TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "contribution-backend",
-        "Content-Type": "application/json",
-    })
+    }
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = resp.read()
-            return resp.status, (json.loads(raw) if raw else None)
-    except urllib.error.HTTPError as e:
-        raw = e.read()
+        response = httpx.request(
+            method,
+            GITHUB_API + path,
+            json=body,
+            headers=headers,
+            timeout=20,
+            follow_redirects=False,
+        )
         try:
-            return e.code, json.loads(raw)
+            payload = response.json() if response.content else None
         except ValueError:
-            return e.code, None
-    except Exception as e:  # timeouts, DNS: previously an unhandled 500
-        print(f"GitHub network error: {e}")
+            payload = None
+        return response.status_code, payload
+    except httpx.RequestError as exc:
+        print(f"GitHub network error: {type(exc).__name__}: {exc}")
         return 0, None
 
 
@@ -118,6 +140,8 @@ def expect(status, *ok, step="", resp=None):
     if status not in ok:
         msg = resp.get("message") if isinstance(resp, dict) else ""
         print(f"GitHub step failed: {step} -> {status} {msg} repo={REPO} base={BASE}")
+        if status == 0:
+            raise HTTPException(503, "GitHub is temporarily unreachable")
         raise HTTPException(502, f"Could not create pull request ({step})")
     
 # ---------- routes ----------
@@ -212,5 +236,8 @@ def submit(edit: Edit, request: Request):
 
     return {"ok": True, "pr_url": pr["html_url"]}
 
-status, ref = gh("GET", f"/repos/{REPO}/git/ref/heads/{BASE}")
-expect(status, 200, step="get base ref", resp=ref)
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))

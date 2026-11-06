@@ -1,4 +1,6 @@
-# Embedded copy of contribute.html. The server replaces __API_URL__ and __RAW_BASE__ at startup.
+# Embedded fallback copy of contribute.html. The server replaces __API_URL__ and __RAW_BASE__ at startup.
+from pathlib import Path
+
 FORM_TEMPLATE = r'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -200,3 +202,6 @@ FORM_TEMPLATE = r'''<!DOCTYPE html>
 </body>
 </html>
 '''
+
+# Keep the editable frontend in one canonical file during local development and deployment.
+FORM_TEMPLATE = (Path(__file__).with_name("contribute.html")).read_text(encoding="utf-8")
