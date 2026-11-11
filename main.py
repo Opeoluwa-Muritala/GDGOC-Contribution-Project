@@ -11,13 +11,14 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from form import FORM_TEMPLATE
 
 GITHUB_API = "https://api.github.com"
+LOGO_PATH = Path(__file__).with_name("gdg-logo-transparent.png")
 
 
 def load_local_env():
@@ -157,6 +158,15 @@ class Edit(BaseModel):
 @app.get("/", response_class=HTMLResponse)
 def form_page():
     return FORM_HTML
+
+
+@app.get("/gdg-logo-transparent.png", include_in_schema=False)
+def gdg_logo():
+    return FileResponse(
+        LOGO_PATH,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/healthz")
